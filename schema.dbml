@@ -1,0 +1,79 @@
+// WorkLog Settlement System - Database Schema
+// DBML (Database Markup Language) diagram
+
+Project geniex_worklog_settlement {
+  database_type: 'PostgreSQL'
+  Note: 'WorkLog Settlement System - Compensates workers based on time reported against tasks'
+}
+
+// Core domain: Tasks that workers log time against
+Table task {
+  id uuid [pk]
+  title varchar(255) [not null]
+  hourly_rate decimal(10,2) [not null, default: 0]
+}
+
+// Users (workers) - from existing auth system
+Table "user" {
+  id uuid [pk]
+  email varchar(255) [not null, unique]
+  is_active boolean [not null]
+  is_superuser boolean [not null]
+  full_name varchar(255)
+  hashed_password varchar [not null]
+}
+
+// WorkLog: Container for all work done by a user against a task
+Table worklog {
+  id uuid [pk]
+  user_id uuid [not null, ref: > user.id]
+  task_id uuid [not null, ref: > task.id]
+  created_at datetime [not null]
+}
+
+// TimeSegment: Individual time entry - can be removed or adjusted
+Table timesegment {
+  id uuid [pk]
+  worklog_id uuid [not null, ref: > worklog.id]
+  minutes integer [not null]
+  status timesegmentstatus [not null]
+  created_at datetime [not null]
+}
+
+Enum timesegmentstatus {
+  ACTIVE
+  REMOVED
+}
+
+// Adjustment: Retroactive deductions/additions applied to worklogs
+Table adjustment {
+  id uuid [pk]
+  worklog_id uuid [not null, ref: > worklog.id]
+  amount decimal(12,2) [not null]
+  reason varchar(500)
+  created_at datetime [not null]
+}
+
+// Remittance: Settlement/payout for a user (one per settlement run)
+Table remittance {
+  id uuid [pk]
+  user_id uuid [not null, ref: > user.id]
+  total_amount decimal(12,2) [not null]
+  status remittancestatus [not null]
+  created_at datetime [not null]
+}
+
+Enum remittancestatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+// RemittanceWorkLog: Links worklogs to remittances with amount snapshot at settlement time
+Table remittanceworklog {
+  id uuid [pk]
+  remittance_id uuid [not null, ref: > remittance.id]
+  worklog_id uuid [not null, ref: > worklog.id]
+  amount decimal(12,2) [not null]
+}

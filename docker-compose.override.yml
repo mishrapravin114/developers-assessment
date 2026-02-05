@@ -47,8 +47,7 @@ services:
 
   db:
     restart: "no"
-    ports:
-      - "5432:5432"
+    # No port exposure - backend connects via docker network. Use "docker compose run" for tests.
 
   adminer:
     restart: "no"

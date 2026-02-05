@@ -1,7 +1,23 @@
+import decimal
 import uuid
+from datetime import datetime
+from enum import Enum
 
 from pydantic import EmailStr
 from sqlmodel import Field, Relationship, SQLModel
+
+
+# WorkLog Settlement System Enums
+class TimeSegmentStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    REMOVED = "REMOVED"
+
+
+class RemittanceStatus(str, Enum):
+    PENDING = "PENDING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 # Shared properties
@@ -44,6 +60,8 @@ class User(UserBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     hashed_password: str
     items: list["Item"] = Relationship(back_populates="owner", cascade_delete=True)
+    worklogs: list["WorkLog"] = Relationship(back_populates="user", cascade_delete=True)
+    remittances: list["Remittance"] = Relationship(back_populates="user", cascade_delete=True)
 
 
 # Properties to return via API, id is always required
@@ -90,6 +108,79 @@ class ItemPublic(ItemBase):
 class ItemsPublic(SQLModel):
     data: list[ItemPublic]
     count: int
+
+
+# WorkLog Settlement System Models
+class Task(SQLModel, table=True):
+    """A task that workers can log time against."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    title: str = Field(max_length=255)
+    hourly_rate: decimal.Decimal = Field(default=decimal.Decimal("0"), max_digits=10, decimal_places=2)
+    worklogs: list["WorkLog"] = Relationship(back_populates="task", cascade_delete=True)
+
+
+class WorkLog(SQLModel, table=True):
+    """Container for all work done by a user against a task."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", nullable=False, ondelete="CASCADE")
+    task_id: uuid.UUID = Field(foreign_key="task.id", nullable=False, ondelete="CASCADE")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    user: User | None = Relationship(back_populates="worklogs")
+    task: Task | None = Relationship(back_populates="worklogs")
+    time_segments: list["TimeSegment"] = Relationship(back_populates="worklog", cascade_delete=True)
+    adjustments: list["Adjustment"] = Relationship(back_populates="worklog", cascade_delete=True)
+    remittance_worklogs: list["RemittanceWorkLog"] = Relationship(
+        back_populates="worklog", cascade_delete=True
+    )
+
+
+class TimeSegment(SQLModel, table=True):
+    """Individual time entry within a worklog. Can be removed or adjusted."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    worklog_id: uuid.UUID = Field(foreign_key="worklog.id", nullable=False, ondelete="CASCADE")
+    minutes: int = Field(ge=0)
+    status: TimeSegmentStatus = Field(default=TimeSegmentStatus.ACTIVE)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    worklog: WorkLog | None = Relationship(back_populates="time_segments")
+
+
+class Adjustment(SQLModel, table=True):
+    """Retroactive deduction or addition applied to a worklog."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    worklog_id: uuid.UUID = Field(foreign_key="worklog.id", nullable=False, ondelete="CASCADE")
+    amount: decimal.Decimal = Field(max_digits=12, decimal_places=2)  # Negative for deductions
+    reason: str | None = Field(default=None, max_length=500)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    worklog: WorkLog | None = Relationship(back_populates="adjustments")
+
+
+class Remittance(SQLModel, table=True):
+    """Settlement/payout for a user. One per settlement run."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", nullable=False, ondelete="CASCADE")
+    total_amount: decimal.Decimal = Field(default=decimal.Decimal("0"), max_digits=12, decimal_places=2)
+    status: RemittanceStatus = Field(default=RemittanceStatus.PENDING)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    user: User | None = Relationship(back_populates="remittances")
+    remittance_worklogs: list["RemittanceWorkLog"] = Relationship(
+        back_populates="remittance", cascade_delete=True
+    )
+
+
+class RemittanceWorkLog(SQLModel, table=True):
+    """Links worklogs to remittances with amount snapshot at settlement time."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    remittance_id: uuid.UUID = Field(foreign_key="remittance.id", nullable=False, ondelete="CASCADE")
+    worklog_id: uuid.UUID = Field(foreign_key="worklog.id", nullable=False, ondelete="CASCADE")
+    amount: decimal.Decimal = Field(max_digits=12, decimal_places=2)
+    remittance: Remittance | None = Relationship(back_populates="remittance_worklogs")
+    worklog: WorkLog | None = Relationship(back_populates="remittance_worklogs")
 
 
 # Generic message
