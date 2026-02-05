@@ -1,7 +1,7 @@
 import decimal
 import uuid
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.models import (
     Adjustment,
@@ -18,26 +18,48 @@ from app.models import (
 
 def calculate_worklog_amount(session: Session, worklog: WorkLog) -> decimal.Decimal:
     """Calculate the current amount for a worklog from time segments and adjustments."""
-    # Sum active time segments (minutes)
-    time_stmt = (
-        select(TimeSegment.minutes)
-        .where(TimeSegment.worklog_id == worklog.id)
+    amounts = _calculate_worklog_amounts_batch(session, [worklog.id])
+    return amounts.get(worklog.id, decimal.Decimal("0"))
+
+
+def _calculate_worklog_amounts_batch(
+    session: Session, worklog_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, decimal.Decimal]:
+    """Batch calculate amounts for multiple worklogs. Avoids N+1 queries."""
+    if not worklog_ids:
+        return {}
+
+    ts_stmt = (
+        select(TimeSegment.worklog_id, TimeSegment.minutes)
+        .where(TimeSegment.worklog_id.in_(worklog_ids))
         .where(TimeSegment.status == TimeSegmentStatus.ACTIVE)
     )
-    total_minutes = sum(session.exec(time_stmt).all()) or 0
+    ts_rows = session.exec(ts_stmt).all()
+    minutes_by_wl: dict[uuid.UUID, int] = {}
+    for wl_id, mins in ts_rows:
+        minutes_by_wl[wl_id] = minutes_by_wl.get(wl_id, 0) + mins
 
-    # Get task hourly rate
-    task = session.get(Task, worklog.task_id)
-    hourly_rate = task.hourly_rate if task else decimal.Decimal("0")
+    adj_stmt = select(Adjustment.worklog_id, Adjustment.amount).where(
+        Adjustment.worklog_id.in_(worklog_ids)
+    )
+    adj_rows = session.exec(adj_stmt).all()
+    adj_by_wl: dict[uuid.UUID, decimal.Decimal] = {}
+    for wl_id, amt in adj_rows:
+        adj_by_wl[wl_id] = adj_by_wl.get(wl_id, decimal.Decimal("0")) + amt
 
-    # Amount from time: (minutes / 60) * hourly_rate
-    time_amount = (decimal.Decimal(total_minutes) / 60) * hourly_rate
+    worklogs = session.exec(select(WorkLog).where(WorkLog.id.in_(worklog_ids))).all()
+    task_ids = {wl.task_id for wl in worklogs}
+    tasks = {t.id: t for t in session.exec(select(Task).where(Task.id.in_(task_ids))).all()}
 
-    # Sum adjustments
-    adj_stmt = select(Adjustment.amount).where(Adjustment.worklog_id == worklog.id)
-    adjustments_sum = sum(session.exec(adj_stmt).all()) or decimal.Decimal("0")
-
-    return time_amount + adjustments_sum
+    result: dict[uuid.UUID, decimal.Decimal] = {}
+    for wl in worklogs:
+        total_mins = minutes_by_wl.get(wl.id, 0)
+        task = tasks.get(wl.task_id)
+        rate = task.hourly_rate if task else decimal.Decimal("0")
+        time_amt = (decimal.Decimal(total_mins) / 60) * rate
+        adj_amt = adj_by_wl.get(wl.id, decimal.Decimal("0"))
+        result[wl.id] = time_amt + adj_amt
+    return result
 
 
 def get_unremitted_worklogs(session: Session, user_id: uuid.UUID) -> list[WorkLog]:
@@ -116,54 +138,63 @@ class WorklogService:
         """
         List all worklogs with amount information.
         Filter by remittanceStatus: REMITTED or UNREMITTED.
+        Uses SQL OFFSET/LIMIT for pagination; prefetches Task and RemittanceWorkLog.
         """
-        remitted_ids: set[uuid.UUID] = set()
         rw_stmt = (
-            select(RemittanceWorkLog.worklog_id)
+            select(RemittanceWorkLog.worklog_id, RemittanceWorkLog.amount)
             .join(Remittance, RemittanceWorkLog.remittance_id == Remittance.id)
             .where(Remittance.status == RemittanceStatus.SUCCEEDED)
         )
-        remitted_ids = set(session.exec(rw_stmt).all())
+        remitted_rows = session.exec(rw_stmt).all()
+        remitted_ids = {row[0] for row in remitted_rows}
+        remitted_amounts: dict[uuid.UUID, decimal.Decimal] = {
+            row[0]: row[1] for row in remitted_rows
+        }
 
         if remittance_status:
-            remittance_status_upper = remittance_status.upper()
-            if remittance_status_upper not in ("REMITTED", "UNREMITTED"):
+            rs_upper = remittance_status.upper()
+            if rs_upper not in ("REMITTED", "UNREMITTED"):
                 return {"data": [], "count": 0}
 
         worklogs_stmt = select(WorkLog)
         if remittance_status:
-            remittance_status_upper = remittance_status.upper()
-            if remittance_status_upper == "REMITTED":
+            rs_upper = remittance_status.upper()
+            if rs_upper == "REMITTED":
                 if not remitted_ids:
                     return {"data": [], "count": 0}
                 worklogs_stmt = worklogs_stmt.where(WorkLog.id.in_(remitted_ids))
             else:
-                # UNREMITTED: worklogs not in any succeeded remittance
                 if remitted_ids:
                     worklogs_stmt = worklogs_stmt.where(~WorkLog.id.in_(remitted_ids))
 
-        all_matching = list(session.exec(worklogs_stmt).all())
-        count = len(all_matching)
-        worklogs = all_matching[skip : skip + limit]
+        count_stmt = select(func.count()).select_from(worklogs_stmt.subquery())
+        count = session.exec(count_stmt).one()
+
+        worklogs_stmt = worklogs_stmt.offset(skip).limit(limit)
+        worklogs = list(session.exec(worklogs_stmt).all())
+
+        if not worklogs:
+            return {"data": [], "count": count}
+
+        task_ids = {wl.task_id for wl in worklogs}
+        tasks_stmt = select(Task).where(Task.id.in_(task_ids))
+        tasks_by_id = {t.id: t for t in session.exec(tasks_stmt).all()}
+
+        amounts_by_wl: dict[uuid.UUID, decimal.Decimal] = {}
+        unremitted_ids = [wl.id for wl in worklogs if wl.id not in remitted_ids]
+        if unremitted_ids:
+            amounts_by_wl.update(
+                _calculate_worklog_amounts_batch(session, unremitted_ids)
+            )
+        for wl in worklogs:
+            if wl.id in remitted_ids:
+                amounts_by_wl[wl.id] = remitted_amounts.get(wl.id, decimal.Decimal("0"))
 
         result = []
         for worklog in worklogs:
-            amount = decimal.Decimal("0")
+            task = tasks_by_id.get(worklog.task_id)
+            amount = amounts_by_wl.get(worklog.id, decimal.Decimal("0"))
             is_remitted = worklog.id in remitted_ids
-
-            if is_remitted:
-                rw_stmt = (
-                    select(RemittanceWorkLog)
-                    .join(Remittance, RemittanceWorkLog.remittance_id == Remittance.id)
-                    .where(RemittanceWorkLog.worklog_id == worklog.id)
-                    .where(Remittance.status == RemittanceStatus.SUCCEEDED)
-                )
-                rwl = session.exec(rw_stmt).first()
-                amount = rwl.amount if rwl else decimal.Decimal("0")
-            else:
-                amount = calculate_worklog_amount(session, worklog)
-
-            task = session.get(Task, worklog.task_id)
             result.append(
                 {
                     "id": str(worklog.id),
